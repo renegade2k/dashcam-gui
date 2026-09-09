@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -18,7 +19,7 @@ import (
 var currentWorkDir string
 
 func main() {
-	a := app.New()
+	a := app.NewWithID("com.renegade2k.dashcamgui")
 	w := a.NewWindow("Dashcam GUI")
 	w.Resize(fyne.NewSize(850, 450))
 
@@ -71,9 +72,8 @@ func main() {
 	w.ShowAndRun()
 }
 
-// Bestätigungsfenster vor der Ausführung
+// Bestätigungsfenster vor der Ausführung mit Checkbox-Auswahl
 func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin fyne.Window) {
-	// Vorab-Analyse für die Bestätigungs-Vorschau
 	result, err := camprocessing.AnalyzeAndGroup(dirPath)
 	if err != nil {
 		dialog.ShowError(err, parentWin)
@@ -81,21 +81,46 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 	}
 
 	confirmWin := fyneApp.NewWindow("Operation bestätigen: Kombinieren")
-	confirmWin.Resize(fyne.NewSize(550, 350))
+	confirmWin.Resize(fyne.NewSize(600, 450))
 
-	// Zusammenfassung für den Benutzer aufbauen
-	summaryText := fmt.Sprintf("Erkannter Kamera-Typ: %s\n", result.CamType)
-	summaryText += fmt.Sprintf("Gefundene Tages-Blöcke: %d\n\n", len(result.Blocks))
+	// Map / Liste zur Nachverfolgung der Checkboxen
+	// Key: Index des Blocks, Value: Pointer zur Checkbox
+	checkMap := make(map[int]*widget.Check)
+
+	// Container für die vertikale Liste der Checkboxen
+	checkListContainer := container.NewVBox()
 
 	for i, b := range result.Blocks {
 		formattedDate := fmt.Sprintf("%s.%s.%s", b.DateStr[6:8], b.DateStr[4:6], b.DateStr[0:4])
-		summaryText += fmt.Sprintf("• Block %d (%s): %d Dateien\n", i+1, formattedDate, len(b.Files))
+
+		var labelText string
+		if len(b.Files) == 1 {
+			labelText = fmt.Sprintf("Block %d (%s): 1 Datei (Einzeldatei)", i+1, formattedDate)
+		} else {
+			labelText = fmt.Sprintf("Block %d (%s): %d Dateien", i+1, formattedDate, len(b.Files))
+		}
+
+		chk := widget.NewCheck(labelText, nil)
+
+		// Vorauswahl: Blöcke mit >= 2 Dateien aktivieren, Einzeldateien deaktivieren
+		if len(b.Files) >= 2 {
+			chk.SetChecked(true)
+		} else {
+			chk.SetChecked(false)
+		}
+
+		checkMap[i] = chk
+		checkListContainer.Add(chk)
 	}
 
-	summaryText += "\nBeim Bestätigen wird die Dateiliste tagesweise strukturiert und eine 'kombinieren_uebersicht.txt' im Arbeitsordner erstellt."
-
-	infoLabel := widget.NewLabel(summaryText)
-	infoLabel.Wrapping = fyne.TextWrapWord
+	// Button zum schnellen Auswählen / Abwählen aller Häkchen
+	allSelected := true
+	selectAllBtn := widget.NewButton("Alle / Keine auswählen", func() {
+		allSelected = !allSelected
+		for _, chk := range checkMap {
+			chk.SetChecked(allSelected)
+		}
+	})
 
 	// OK & Abbrechen Buttons
 	cancelBtn := widget.NewButton("Abbrechen", func() {
@@ -103,16 +128,72 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 	})
 
 	okBtn := widget.NewButton("OK (Ausführen)", func() {
-		outPath, err := camprocessing.WriteSummaryFile(dirPath, result)
+		// Ermitteln, welche Blöcke angehakt wurden
+		var selectedBlocks []camprocessing.DayBlock
+		for i, b := range result.Blocks {
+			if chk, ok := checkMap[i]; ok && chk.Checked {
+				selectedBlocks = append(selectedBlocks, b)
+			}
+		}
+
+		if len(selectedBlocks) == 0 {
+			dialog.ShowInformation("Hinweis", "Bitte wähle mindestens einen Tagesblock zum Kombinieren aus.", confirmWin)
+			return
+		}
+
 		confirmWin.Close()
 
-		if err != nil {
-			dialog.ShowError(err, parentWin)
-		} else {
-			dialog.ShowInformation("Erfolg", fmt.Sprintf("Kombinieren-Analyse abgeschlossen!\n\nÜbersicht wurde gespeichert unter:\n%s", outPath), parentWin)
-		}
+		go func() {
+			var errors []string
+			processedBlocks := 0
+
+			for _, block := range selectedBlocks {
+				// 1. Concat-Liste für den Tag schreiben
+				listPath, err := camprocessing.CreateConcatList(dirPath, block)
+				if err != nil {
+					errors = append(errors, fmt.Sprintf("Tag %s: %v", block.DateStr, err))
+					continue
+				}
+
+				// Endung der ersten Datei ermitteln (.mp4 / .mov)
+				ext := filepath.Ext(block.Files[0])
+
+				// 2. FFmpeg Command vorbereiten
+				cmdName, args := camprocessing.BuildFFmpegCmd(dirPath, listPath, block.DateStr, ext)
+				cmd := exec.Command(cmdName, args...)
+
+				// Ausführen
+				output, err := cmd.CombinedOutput()
+
+				// Temporäre Liste nach Aufruf wieder löschen
+				_ = os.Remove(listPath)
+
+				if err != nil {
+					errors = append(errors, fmt.Sprintf("Tag %s Fehler: %v\nOutput: %s", block.DateStr, err, string(output)))
+				} else {
+					processedBlocks++
+				}
+			}
+
+			// Ergebnis anzeigen
+			if len(errors) > 0 {
+				dialog.ShowError(fmt.Errorf("Fehler bei der Ausführung:\n%s", strings.Join(errors, "\n")), parentWin)
+			} else {
+				dialog.ShowInformation("Erfolg", fmt.Sprintf("Erfolgreich %d ausgewählte(n) Tagesblock/Blöcke zusammengefügt!", processedBlocks), parentWin)
+			}
+		}()
 	})
 	okBtn.Importance = widget.HighImportance
+
+	headerText := fmt.Sprintf("Erkannter Kamera-Typ: %s\nArbeitsordner: %s\n\nWähle die Tagesblöcke aus, die zusammengefügt werden sollen:", result.CamType, dirPath)
+	headerLabel := widget.NewLabel(headerText)
+	headerLabel.Wrapping = fyne.TextWrapWord
+
+	topBox := container.NewVBox(
+		headerLabel,
+		selectAllBtn,
+		widget.NewSeparator(),
+	)
 
 	buttonRow := container.NewHBox(
 		cancelBtn,
@@ -120,10 +201,10 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 	)
 
 	content := container.NewBorder(
-		widget.NewLabelWithStyle("Folgende Operation wird ausgeführt:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		topBox,
 		container.NewCenter(buttonRow),
 		nil, nil,
-		container.NewVScroll(infoLabel),
+		container.NewVScroll(checkListContainer),
 	)
 
 	confirmWin.SetContent(container.NewPadded(content))

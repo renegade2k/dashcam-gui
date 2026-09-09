@@ -143,3 +143,44 @@ func WriteSummaryFile(dirPath string, result *ProcessingResult) (string, error) 
 
 	return outputPath, nil
 }
+
+// CreateConcatList erzeugt die temporäre Textdatei für FFmpeg für einen einzelnen Tagesblock
+func CreateConcatList(dirPath string, block DayBlock) (string, error) {
+	listFileName := fmt.Sprintf("concat_list_%s.txt", block.DateStr)
+	listPath := filepath.Join(dirPath, listFileName)
+
+	file, err := os.Create(listPath)
+	if err != nil {
+		return "", fmt.Errorf("Konnte Concat-Liste nicht erstellen: %w", err)
+	}
+	defer file.Close()
+
+	for _, fileName := range block.Files {
+		// Single quotes Maskierung für sichere Pfade in FFmpeg
+		fmt.Fprintf(file, "file '%s'\n", fileName)
+	}
+
+	return listPath, nil
+}
+
+// BuildFFmpegCmd liefert die Argumente für den FFmpeg-Aufruf
+// Beispiel: ffmpeg -f concat -safe 0 -i concat_list_20260327.txt -c copy Kombiniert_2026-03-27.MP4
+func BuildFFmpegCmd(dirPath, listPath, dateStr, extension string) (string, []string) {
+	// Datum von YYYYMMDD in YYYY-MM-DD umwandeln (sicheres Slicing)
+	formattedDate := dateStr
+	if len(dateStr) == 8 {
+		formattedDate = fmt.Sprintf("%s-%s-%s", dateStr[0:4], dateStr[4:6], dateStr[6:8])
+	}
+
+	outputFileName := fmt.Sprintf("Kombiniert_%s%s", formattedDate, extension)
+
+	args := []string{
+		"-f", "concat",
+		"-safe", "0",
+		"-i", listPath,
+		"-c", "copy",
+		filepath.Join(dirPath, outputFileName),
+	}
+
+	return "ffmpeg", args
+}
