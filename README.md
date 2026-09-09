@@ -7,3 +7,5 @@ Zuerst "Arbeitspfad" auswählen. Der Order dient sowohl als Datenquelle, als auc
 Im neuen Fenster des "Kombinieren"-Menüs werden die Videos nach "Blöcken" gruppiert. Bei Blücken, die nur aus einem Video bestehen werden keine weiteren Operationen ausgeführt. Diese sind standardmäßig nicht ausgewählt. Anschließend kann man die Blöcke wählen, die kombiniert werden sollen.
 
 Nach eer Bestätigung werden die einzelnen Clips chronoligisch zu einem langen Video kombiniert. Die Videos müssen nicht zwangsläufig fortlaufend sein.
+
+-= happy vibe-coding =-
