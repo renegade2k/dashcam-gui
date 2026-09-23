@@ -64,7 +64,6 @@ func main() {
 		folderDialog.Show()
 	})
 
-	// Layout-Zeile unter der Pfadanzeige: "Arbeitsordner öffnen" nimmt den Hauptplatz ein, "Videos anzeigen" liegt rechts
 	actionRow := container.NewBorder(nil, nil, nil, showFilesBtn, openFolderBtn)
 
 	content := container.NewVBox(
@@ -72,8 +71,7 @@ func main() {
 		selectBtn,
 		pathLabel,
 		actionRow,
-		widget.NewSeparator(),
-		widget.NewSeparator(),
+		widget.NewSeparator(), // Visuelle Trennlinie zwischen Schritt 1 und 2
 		widget.NewLabel("Schritt 2: Operationen durchführen"),
 		combineBtn,
 		cutVideoBtn,
@@ -139,18 +137,15 @@ func openCutWindow(fyneApp fyne.App, dirPath string, parentWin fyne.Window) {
 			return
 		}
 
-		// Bereinigen der Zeitangaben für den Dateinamen (z.B. "1:20" -> "1-20")
 		cleanStart := strings.ReplaceAll(strings.TrimSpace(startEntry.Text), ":", "-")
 		cleanStop := strings.ReplaceAll(strings.TrimSpace(stopEntry.Text), ":", "-")
 
 		ext := filepath.Ext(selectedFile)
 		baseName := strings.TrimSuffix(selectedFile, ext)
 
-		// Eindeutigen Dateinamen generieren (z.B. Video_cut_50_bis_2-20.mp4)
 		outName := fmt.Sprintf("%s_cut_%s_bis_%s%s", baseName, cleanStart, cleanStop, ext)
 		outputPath := filepath.Join(dirPath, outName)
 
-		// Falls die Datei bereits existiert, laufende Nummer anhängen (_1, _2, ...)
 		counter := 1
 		for {
 			if _, err := os.Stat(outputPath); os.IsNotExist(err) {
@@ -165,7 +160,12 @@ func openCutWindow(fyneApp fyne.App, dirPath string, parentWin fyne.Window) {
 
 		cutWin.Close()
 
+		// Ladeindikator einblenden
+		progressDialog := showProgressDialog("Video wird geschnitten...", parentWin)
+
 		go func() {
+			defer progressDialog.Hide()
+
 			err := videocut.ProcessCut(inputPath, outputPath, startEntry.Text, stopEntry.Text)
 			if err != nil {
 				dialog.ShowError(fmt.Errorf("Fehler beim Schneiden:\n%v", err), parentWin)
@@ -204,7 +204,7 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 	}
 
 	confirmWin := fyneApp.NewWindow("Operation bestätigen: Kombinieren")
-	confirmWin.Resize(fyne.NewSize(600, 450))
+	confirmWin.Resize(fyne.NewSize(600, 480))
 
 	checkMap := make(map[int]*widget.Check)
 	checkListContainer := container.NewVBox()
@@ -239,6 +239,10 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 		}
 	})
 
+	// Checkbox für das automatische Verschieben verarbeiteter Rohdateien
+	moveFilesCheck := widget.NewCheck("Quelldateien nach dem Kombinieren in Ordner 'verarbeitet' verschieben", nil)
+	moveFilesCheck.SetChecked(false)
+
 	cancelBtn := widget.NewButton("Abbrechen", func() {
 		confirmWin.Close()
 	})
@@ -256,9 +260,16 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 			return
 		}
 
+		shouldMove := moveFilesCheck.Checked
+
 		confirmWin.Close()
 
+		// Ladeindikator einblenden
+		progressDialog := showProgressDialog("Videos werden zusammengefügt...", parentWin)
+
 		go func() {
+			defer progressDialog.Hide()
+
 			var errors []string
 			processedBlocks := 0
 
@@ -280,13 +291,22 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 					errors = append(errors, fmt.Sprintf("Tag %s Fehler: %v\nOutput: %s", block.DateStr, err, string(output)))
 				} else {
 					processedBlocks++
+
+					// Wenn gewünscht, Quelldateien nach "verarbeitet" verschieben
+					if shouldMove {
+						_ = moveFilesToSubfolder(dirPath, block.Files, "verarbeitet")
+					}
 				}
 			}
 
 			if len(errors) > 0 {
 				dialog.ShowError(fmt.Errorf("Fehler bei der Ausführung:\n%s", strings.Join(errors, "\n")), parentWin)
 			} else {
-				dialog.ShowInformation("Erfolg", fmt.Sprintf("Erfolgreich %d ausgewählte(n) Tagesblock/Blöcke zusammengefügt!", processedBlocks), parentWin)
+				msg := fmt.Sprintf("Erfolgreich %d ausgewählte(n) Tagesblock/Blöcke zusammengefügt!", processedBlocks)
+				if shouldMove {
+					msg += "\n\nDie Quelldateien wurden in den Ordner 'verarbeitet' verschoben."
+				}
+				dialog.ShowInformation("Erfolg", msg, parentWin)
 			}
 		}()
 	})
@@ -302,20 +322,54 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 		widget.NewSeparator(),
 	)
 
-	buttonRow := container.NewHBox(
-		cancelBtn,
-		okBtn,
+	bottomBox := container.NewVBox(
+		widget.NewSeparator(),
+		moveFilesCheck,
+		container.NewCenter(container.NewHBox(cancelBtn, okBtn)),
 	)
 
 	content := container.NewBorder(
 		topBox,
-		container.NewCenter(buttonRow),
+		bottomBox,
 		nil, nil,
 		container.NewVScroll(checkListContainer),
 	)
 
 	confirmWin.SetContent(container.NewPadded(content))
 	confirmWin.Show()
+}
+
+// Erstellt und zeigt einen Lade-Dialog mit unendlicher Progressbar
+func showProgressDialog(message string, parentWin fyne.Window) dialog.Dialog {
+	progressBar := widget.NewProgressBarInfinite()
+	label := widget.NewLabel(message)
+	label.TextStyle = fyne.TextStyle{Bold: true}
+
+	content := container.NewVBox(
+		label,
+		widget.NewLabel("Bitte warten, FFmpeg arbeitet im Hintergrund..."),
+		progressBar,
+	)
+
+	d := dialog.NewCustomWithoutButtons("Verarbeitung läuft", content, parentWin)
+	d.Show()
+	return d
+}
+
+// Verschiebt eine Liste von Dateien in einen Unterordner
+func moveFilesToSubfolder(dirPath string, filenames []string, subfolder string) error {
+	targetDir := filepath.Join(dirPath, subfolder)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return err
+	}
+
+	for _, fname := range filenames {
+		oldPath := filepath.Join(dirPath, fname)
+		newPath := filepath.Join(targetDir, fname)
+		_ = os.Rename(oldPath, newPath)
+	}
+
+	return nil
 }
 
 // Öffnet Popup zur Dateianzeige
