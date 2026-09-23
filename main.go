@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -14,62 +15,184 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"dashcam-gui/camprocessing"
+	"dashcam-gui/videocut"
 )
 
 var currentWorkDir string
 
 func main() {
-	a := app.NewWithID("com.renegade2k.dashcamgui")
+	a := app.NewWithID("com.dashcam.gui")
 	w := a.NewWindow("Dashcam GUI")
-	w.Resize(fyne.NewSize(850, 450))
+	w.Resize(fyne.NewSize(850, 480))
 
-	// Pfad-Label
 	pathLabel := widget.NewLabel("Kein Arbeitsordner ausgewählt")
 	pathLabel.TextStyle = fyne.TextStyle{Bold: true}
 
-	// Button: Dateiliste-Popup (anfangs deaktiviert)
 	showFilesBtn := widget.NewButton("Videos anzeigen", func() {
 		openFileListWindow(a, currentWorkDir)
 	})
 	showFilesBtn.Disable()
 
-	// NEW: Button "Kombinieren" (anfangs deaktiviert)
+	openFolderBtn := widget.NewButton("Arbeitsordner öffnen", func() {
+		openWorkingFolder(currentWorkDir)
+	})
+	openFolderBtn.Disable()
+
 	combineBtn := widget.NewButton("Kombinieren", func() {
 		openCombineConfirmationWindow(a, currentWorkDir, w)
 	})
 	combineBtn.Disable()
 
-	// Button: Ordnerauswahl
+	cutVideoBtn := widget.NewButton("Video schneiden", func() {
+		openCutWindow(a, currentWorkDir, w)
+	})
+	cutVideoBtn.Disable()
+
 	selectBtn := widget.NewButton("Arbeitsordner wählen...", func() {
 		folderDialog := dialog.NewFolderOpen(func(uri fyne.ListableURI, err error) {
 			if err != nil || uri == nil {
 				return
 			}
-
 			currentWorkDir = uri.Path()
 			pathLabel.SetText("Aktueller Pfad: " + currentWorkDir)
 
 			showFilesBtn.Enable()
 			combineBtn.Enable()
+			openFolderBtn.Enable()
+			cutVideoBtn.Enable()
 		}, w)
-
 		folderDialog.Show()
 	})
 
-	pathRow := container.NewBorder(nil, nil, nil, showFilesBtn, pathLabel)
+	// Layout-Zeile unter der Pfadanzeige: "Arbeitsordner öffnen" nimmt den Hauptplatz ein, "Videos anzeigen" liegt rechts
+	actionRow := container.NewBorder(nil, nil, nil, showFilesBtn, openFolderBtn)
 
 	content := container.NewVBox(
 		widget.NewLabel("Schritt 1: Wähle den Ordner mit deinen Dashcam-Aufnahmen"),
 		selectBtn,
+		pathLabel,
+		actionRow,
 		widget.NewSeparator(),
-		pathRow,
 		widget.NewSeparator(),
 		widget.NewLabel("Schritt 2: Operationen durchführen"),
 		combineBtn,
+		cutVideoBtn,
 	)
 
 	w.SetContent(container.NewPadded(content))
 	w.ShowAndRun()
+}
+
+// Öffnet den System-Dateimanager plattformunabhängig
+func openWorkingFolder(path string) {
+	cleanPath := filepath.FromSlash(filepath.Clean(path))
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("explorer", cleanPath)
+	case "linux":
+		cmd = exec.Command("xdg-open", cleanPath)
+	default:
+		cmd = exec.Command("open", cleanPath)
+	}
+	_ = cmd.Start()
+}
+
+// Fenster für den Videoschnitt
+func openCutWindow(fyneApp fyne.App, dirPath string, parentWin fyne.Window) {
+	videos := loadVideoFiles(dirPath)
+	if len(videos) == 0 {
+		dialog.ShowInformation("Hinweis", "Keine Videodateien im Ordner gefunden.", parentWin)
+		return
+	}
+
+	cutWin := fyneApp.NewWindow("Video schneiden")
+	cutWin.Resize(fyne.NewSize(600, 450))
+
+	var selectedFile string
+
+	videoList := widget.NewList(
+		func() int { return len(videos) },
+		func() fyne.CanvasObject { return widget.NewLabel("Template Video.mp4") },
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			o.(*widget.Label).SetText(videos[i])
+		},
+	)
+	videoList.OnSelected = func(id widget.ListItemID) {
+		selectedFile = videos[id]
+	}
+
+	startEntry := widget.NewEntry()
+	startEntry.SetPlaceHolder("Start (z.B. 50 oder 1:20)")
+
+	stopEntry := widget.NewEntry()
+	stopEntry.SetPlaceHolder("Ende (z.B. 120 oder 2:45)")
+
+	executeCutBtn := widget.NewButton("Ausschnitt exportieren", func() {
+		if selectedFile == "" {
+			dialog.ShowInformation("Hinweis", "Bitte wähle ein Video aus der Liste aus.", cutWin)
+			return
+		}
+		if startEntry.Text == "" || stopEntry.Text == "" {
+			dialog.ShowInformation("Hinweis", "Bitte Start- und Endzeit angeben.", cutWin)
+			return
+		}
+
+		// Bereinigen der Zeitangaben für den Dateinamen (z.B. "1:20" -> "1-20")
+		cleanStart := strings.ReplaceAll(strings.TrimSpace(startEntry.Text), ":", "-")
+		cleanStop := strings.ReplaceAll(strings.TrimSpace(stopEntry.Text), ":", "-")
+
+		ext := filepath.Ext(selectedFile)
+		baseName := strings.TrimSuffix(selectedFile, ext)
+
+		// Eindeutigen Dateinamen generieren (z.B. Video_cut_50_bis_2-20.mp4)
+		outName := fmt.Sprintf("%s_cut_%s_bis_%s%s", baseName, cleanStart, cleanStop, ext)
+		outputPath := filepath.Join(dirPath, outName)
+
+		// Falls die Datei bereits existiert, laufende Nummer anhängen (_1, _2, ...)
+		counter := 1
+		for {
+			if _, err := os.Stat(outputPath); os.IsNotExist(err) {
+				break
+			}
+			outName = fmt.Sprintf("%s_cut_%s_bis_%s_(%d)%s", baseName, cleanStart, cleanStop, counter, ext)
+			outputPath = filepath.Join(dirPath, outName)
+			counter++
+		}
+
+		inputPath := filepath.Join(dirPath, selectedFile)
+
+		cutWin.Close()
+
+		go func() {
+			err := videocut.ProcessCut(inputPath, outputPath, startEntry.Text, stopEntry.Text)
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("Fehler beim Schneiden:\n%v", err), parentWin)
+			} else {
+				dialog.ShowInformation("Erfolg", fmt.Sprintf("Ausschnitt erfolgreich gespeichert als:\n%s", outName), parentWin)
+			}
+		}()
+	})
+	executeCutBtn.Importance = widget.HighImportance
+
+	inputForm := container.NewVBox(
+		widget.NewLabelWithStyle("1. Video in der Liste markieren:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabelWithStyle("2. Zeiten festlegen (Sekunden oder MM:SS):", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewGridWithColumns(2, startEntry, stopEntry),
+		widget.NewSeparator(),
+		executeCutBtn,
+	)
+
+	content := container.NewBorder(
+		nil,
+		inputForm,
+		nil, nil,
+		videoList,
+	)
+
+	cutWin.SetContent(container.NewPadded(content))
+	cutWin.Show()
 }
 
 // Bestätigungsfenster vor der Ausführung mit Checkbox-Auswahl
@@ -83,11 +206,7 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 	confirmWin := fyneApp.NewWindow("Operation bestätigen: Kombinieren")
 	confirmWin.Resize(fyne.NewSize(600, 450))
 
-	// Map / Liste zur Nachverfolgung der Checkboxen
-	// Key: Index des Blocks, Value: Pointer zur Checkbox
 	checkMap := make(map[int]*widget.Check)
-
-	// Container für die vertikale Liste der Checkboxen
 	checkListContainer := container.NewVBox()
 
 	for i, b := range result.Blocks {
@@ -102,7 +221,6 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 
 		chk := widget.NewCheck(labelText, nil)
 
-		// Vorauswahl: Blöcke mit >= 2 Dateien aktivieren, Einzeldateien deaktivieren
 		if len(b.Files) >= 2 {
 			chk.SetChecked(true)
 		} else {
@@ -113,7 +231,6 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 		checkListContainer.Add(chk)
 	}
 
-	// Button zum schnellen Auswählen / Abwählen aller Häkchen
 	allSelected := true
 	selectAllBtn := widget.NewButton("Alle / Keine auswählen", func() {
 		allSelected = !allSelected
@@ -122,13 +239,11 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 		}
 	})
 
-	// OK & Abbrechen Buttons
 	cancelBtn := widget.NewButton("Abbrechen", func() {
 		confirmWin.Close()
 	})
 
 	okBtn := widget.NewButton("OK (Ausführen)", func() {
-		// Ermitteln, welche Blöcke angehakt wurden
 		var selectedBlocks []camprocessing.DayBlock
 		for i, b := range result.Blocks {
 			if chk, ok := checkMap[i]; ok && chk.Checked {
@@ -148,24 +263,17 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 			processedBlocks := 0
 
 			for _, block := range selectedBlocks {
-				// 1. Concat-Liste für den Tag schreiben
 				listPath, err := camprocessing.CreateConcatList(dirPath, block)
 				if err != nil {
 					errors = append(errors, fmt.Sprintf("Tag %s: %v", block.DateStr, err))
 					continue
 				}
 
-				// Endung der ersten Datei ermitteln (.mp4 / .mov)
 				ext := filepath.Ext(block.Files[0])
-
-				// 2. FFmpeg Command vorbereiten
 				cmdName, args := camprocessing.BuildFFmpegCmd(dirPath, listPath, block.DateStr, ext)
 				cmd := exec.Command(cmdName, args...)
 
-				// Ausführen
 				output, err := cmd.CombinedOutput()
-
-				// Temporäre Liste nach Aufruf wieder löschen
 				_ = os.Remove(listPath)
 
 				if err != nil {
@@ -175,7 +283,6 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 				}
 			}
 
-			// Ergebnis anzeigen
 			if len(errors) > 0 {
 				dialog.ShowError(fmt.Errorf("Fehler bei der Ausführung:\n%s", strings.Join(errors, "\n")), parentWin)
 			} else {
@@ -211,7 +318,7 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 	confirmWin.Show()
 }
 
-// Öffnet Popup zur Dateianzeige (unverändert)
+// Öffnet Popup zur Dateianzeige
 func openFileListWindow(fyneApp fyne.App, dirPath string) {
 	videoFiles := loadVideoFiles(dirPath)
 
@@ -236,7 +343,7 @@ func openFileListWindow(fyneApp fyne.App, dirPath string) {
 	listWin.Show()
 }
 
-// Liest den Pfad neutral aus und zeigt ALLE Videos an (unabhängig vom Schema)
+// Liest den Pfad neutral aus und zeigt ALLE Videos an
 func loadVideoFiles(dirPath string) []string {
 	var files []string
 
