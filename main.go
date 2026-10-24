@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,33 +19,34 @@ import (
 	"dashcam-gui/videocut"
 )
 
-var currentWorkDir string
-
 func main() {
 	a := app.NewWithID("com.dashcam.gui")
 	w := a.NewWindow("Dashcam GUI")
 	w.Resize(fyne.NewSize(850, 480))
 
+	var workDir string
+	ffmpegOK := camprocessing.FFmpegAvailable()
+
 	pathLabel := widget.NewLabel("Kein Arbeitsordner ausgewählt")
 	pathLabel.TextStyle = fyne.TextStyle{Bold: true}
 
 	showFilesBtn := widget.NewButton("Videos anzeigen", func() {
-		openFileListWindow(a, currentWorkDir)
+		openFileListWindow(a, workDir)
 	})
 	showFilesBtn.Disable()
 
 	openFolderBtn := widget.NewButton("Arbeitsordner öffnen", func() {
-		openWorkingFolder(currentWorkDir)
+		openWorkingFolder(workDir)
 	})
 	openFolderBtn.Disable()
 
 	combineBtn := widget.NewButton("Kombinieren", func() {
-		openCombineConfirmationWindow(a, currentWorkDir, w)
+		openCombineConfirmationWindow(a, workDir, w)
 	})
 	combineBtn.Disable()
 
 	cutVideoBtn := widget.NewButton("Video schneiden", func() {
-		openCutWindow(a, currentWorkDir, w)
+		openCutWindow(a, workDir, w)
 	})
 	cutVideoBtn.Disable()
 
@@ -53,13 +55,16 @@ func main() {
 			if err != nil || uri == nil {
 				return
 			}
-			currentWorkDir = uri.Path()
-			pathLabel.SetText("Aktueller Pfad: " + currentWorkDir)
+			workDir = uri.Path()
+			pathLabel.SetText("Aktueller Pfad: " + workDir)
 
 			showFilesBtn.Enable()
-			combineBtn.Enable()
 			openFolderBtn.Enable()
-			cutVideoBtn.Enable()
+			// Kombinieren und Schneiden brauchen FFmpeg
+			if ffmpegOK {
+				combineBtn.Enable()
+				cutVideoBtn.Enable()
+			}
 		}, w)
 		folderDialog.Show()
 	})
@@ -77,12 +82,22 @@ func main() {
 		cutVideoBtn,
 	)
 
+	if !ffmpegOK {
+		warn := widget.NewLabel("⚠ FFmpeg wurde nicht gefunden. Bitte installieren und im PATH verfügbar machen, dann die App neu starten.")
+		warn.Wrapping = fyne.TextWrapWord
+		warn.Importance = widget.WarningImportance
+		content.Add(warn)
+	}
+
 	w.SetContent(container.NewPadded(content))
 	w.ShowAndRun()
 }
 
 // Öffnet den System-Dateimanager plattformunabhängig
 func openWorkingFolder(path string) {
+	if path == "" {
+		return
+	}
 	cleanPath := filepath.FromSlash(filepath.Clean(path))
 
 	var cmd *exec.Cmd
@@ -94,7 +109,33 @@ func openWorkingFolder(path string) {
 	default:
 		cmd = exec.Command("open", cleanPath)
 	}
-	_ = cmd.Start()
+
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	// Prozess im Hintergrund einsammeln, damit keine Zombie-Prozesse entstehen
+	go func() { _ = cmd.Wait() }()
+}
+
+// uniqueFileName liefert einen Dateinamen, der im Ordner noch nicht existiert:
+// stem+ext, danach stem_(1)+ext, stem_(2)+ext, ...
+func uniqueFileName(dirPath, stem, ext string) string {
+	name := stem + ext
+	for i := 1; ; i++ {
+		if _, err := os.Stat(filepath.Join(dirPath, name)); err != nil {
+			return name
+		}
+		name = fmt.Sprintf("%s_(%d)%s", stem, i, ext)
+	}
+}
+
+// tail kürzt lange Texte (z.B. FFmpeg-Ausgaben) auf die letzten n Zeichen
+func tail(s string, n int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= n {
+		return string(r)
+	}
+	return "…" + string(r[len(r)-n:])
 }
 
 // Fenster für den Videoschnitt
@@ -120,6 +161,9 @@ func openCutWindow(fyneApp fyne.App, dirPath string, parentWin fyne.Window) {
 	videoList.OnSelected = func(id widget.ListItemID) {
 		selectedFile = videos[id]
 	}
+	videoList.OnUnselected = func(id widget.ListItemID) {
+		selectedFile = ""
+	}
 
 	startEntry := widget.NewEntry()
 	startEntry.SetPlaceHolder("Start (z.B. 50 oder 1:20)")
@@ -132,30 +176,30 @@ func openCutWindow(fyneApp fyne.App, dirPath string, parentWin fyne.Window) {
 			dialog.ShowInformation("Hinweis", "Bitte wähle ein Video aus der Liste aus.", cutWin)
 			return
 		}
-		if startEntry.Text == "" || stopEntry.Text == "" {
+
+		startText := strings.TrimSpace(startEntry.Text)
+		stopText := strings.TrimSpace(stopEntry.Text)
+		if startText == "" || stopText == "" {
 			dialog.ShowInformation("Hinweis", "Bitte Start- und Endzeit angeben.", cutWin)
 			return
 		}
 
-		cleanStart := strings.ReplaceAll(strings.TrimSpace(startEntry.Text), ":", "-")
-		cleanStop := strings.ReplaceAll(strings.TrimSpace(stopEntry.Text), ":", "-")
+		// Eingaben prüfen, solange das Fenster noch offen ist
+		if _, _, err := videocut.ValidateRange(startText, stopText); err != nil {
+			dialog.ShowError(err, cutWin)
+			return
+		}
+
+		// Nach der Prüfung enthalten die Eingaben nur noch Ziffern, ':', '.' und ','
+		nameSafe := strings.NewReplacer(":", "-", ",", ".")
+		cleanStart := nameSafe.Replace(startText)
+		cleanStop := nameSafe.Replace(stopText)
 
 		ext := filepath.Ext(selectedFile)
 		baseName := strings.TrimSuffix(selectedFile, ext)
 
-		outName := fmt.Sprintf("%s_cut_%s_bis_%s%s", baseName, cleanStart, cleanStop, ext)
+		outName := uniqueFileName(dirPath, fmt.Sprintf("%s_cut_%s_bis_%s", baseName, cleanStart, cleanStop), ext)
 		outputPath := filepath.Join(dirPath, outName)
-
-		counter := 1
-		for {
-			if _, err := os.Stat(outputPath); os.IsNotExist(err) {
-				break
-			}
-			outName = fmt.Sprintf("%s_cut_%s_bis_%s_(%d)%s", baseName, cleanStart, cleanStop, counter, ext)
-			outputPath = filepath.Join(dirPath, outName)
-			counter++
-		}
-
 		inputPath := filepath.Join(dirPath, selectedFile)
 
 		cutWin.Close()
@@ -164,28 +208,33 @@ func openCutWindow(fyneApp fyne.App, dirPath string, parentWin fyne.Window) {
 		progressDialog := showProgressDialog("Video wird geschnitten...", parentWin)
 
 		go func() {
-			defer progressDialog.Hide()
+			err := videocut.ProcessCut(inputPath, outputPath, startText, stopText)
 
-			err := videocut.ProcessCut(inputPath, outputPath, startEntry.Text, stopEntry.Text)
-			if err != nil {
-				dialog.ShowError(fmt.Errorf("Fehler beim Schneiden:\n%v", err), parentWin)
-			} else {
-				dialog.ShowInformation("Erfolg", fmt.Sprintf("Ausschnitt erfolgreich gespeichert als:\n%s", outName), parentWin)
-			}
+			// UI-Änderungen müssen im Fyne-Hauptthread laufen
+			fyne.Do(func() {
+				progressDialog.Hide()
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("Fehler beim Schneiden:\n%v", err), parentWin)
+				} else {
+					dialog.ShowInformation("Erfolg", fmt.Sprintf("Ausschnitt erfolgreich gespeichert als:\n%s", outName), parentWin)
+				}
+			})
 		}()
 	})
 	executeCutBtn.Importance = widget.HighImportance
 
+	topLabel := widget.NewLabelWithStyle("1. Video in der Liste markieren:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+
 	inputForm := container.NewVBox(
-		widget.NewLabelWithStyle("1. Video in der Liste markieren:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		widget.NewLabelWithStyle("2. Zeiten festlegen (Sekunden oder MM:SS):", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.NewGridWithColumns(2, startEntry, stopEntry),
+		widget.NewLabel("Hinweis: Der Schnitt erfolgt verlustfrei an Keyframes und ist daher nicht sekundengenau."),
 		widget.NewSeparator(),
 		executeCutBtn,
 	)
 
 	content := container.NewBorder(
-		nil,
+		topLabel,
 		inputForm,
 		nil, nil,
 		videoList,
@@ -206,7 +255,7 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 	confirmWin := fyneApp.NewWindow("Operation bestätigen: Kombinieren")
 	confirmWin.Resize(fyne.NewSize(600, 480))
 
-	checkMap := make(map[int]*widget.Check)
+	checks := make([]*widget.Check, len(result.Blocks))
 	checkListContainer := container.NewVBox()
 
 	for i, b := range result.Blocks {
@@ -220,22 +269,24 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 		}
 
 		chk := widget.NewCheck(labelText, nil)
+		// Blöcke mit nur einer Datei sind standardmäßig abgewählt
+		chk.SetChecked(len(b.Files) >= 2)
 
-		if len(b.Files) >= 2 {
-			chk.SetChecked(true)
-		} else {
-			chk.SetChecked(false)
-		}
-
-		checkMap[i] = chk
+		checks[i] = chk
 		checkListContainer.Add(chk)
 	}
 
-	allSelected := true
+	// Sind alle ausgewählt, werden alle abgewählt – sonst werden alle ausgewählt
 	selectAllBtn := widget.NewButton("Alle / Keine auswählen", func() {
-		allSelected = !allSelected
-		for _, chk := range checkMap {
-			chk.SetChecked(allSelected)
+		allChecked := true
+		for _, chk := range checks {
+			if !chk.Checked {
+				allChecked = false
+				break
+			}
+		}
+		for _, chk := range checks {
+			chk.SetChecked(!allChecked)
 		}
 	})
 
@@ -250,7 +301,7 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 	okBtn := widget.NewButton("OK (Ausführen)", func() {
 		var selectedBlocks []camprocessing.DayBlock
 		for i, b := range result.Blocks {
-			if chk, ok := checkMap[i]; ok && chk.Checked {
+			if checks[i].Checked {
 				selectedBlocks = append(selectedBlocks, b)
 			}
 		}
@@ -268,51 +319,79 @@ func openCombineConfirmationWindow(fyneApp fyne.App, dirPath string, parentWin f
 		progressDialog := showProgressDialog("Videos werden zusammengefügt...", parentWin)
 
 		go func() {
-			defer progressDialog.Hide()
-
-			var errors []string
-			processedBlocks := 0
+			var failures []string
+			var outputs []string
+			movedAll := true
 
 			for _, block := range selectedBlocks {
 				listPath, err := camprocessing.CreateConcatList(dirPath, block)
 				if err != nil {
-					errors = append(errors, fmt.Sprintf("Tag %s: %v", block.DateStr, err))
+					failures = append(failures, fmt.Sprintf("Tag %s: %v", block.DateStr, err))
 					continue
 				}
 
 				ext := filepath.Ext(block.Files[0])
-				cmdName, args := camprocessing.BuildFFmpegCmd(dirPath, listPath, block.DateStr, ext)
+				cmdName, args, outName := camprocessing.BuildFFmpegCmd(dirPath, listPath, block.DateStr, ext)
 				cmd := exec.Command(cmdName, args...)
 
 				output, err := cmd.CombinedOutput()
 				_ = os.Remove(listPath)
 
 				if err != nil {
-					errors = append(errors, fmt.Sprintf("Tag %s Fehler: %v\nOutput: %s", block.DateStr, err, string(output)))
-				} else {
-					processedBlocks++
+					failures = append(failures, fmt.Sprintf("Tag %s: %v\nFFmpeg-Ausgabe: %s", block.DateStr, err, tail(string(output), 600)))
+					continue
+				}
 
-					// Wenn gewünscht, Quelldateien nach "verarbeitet" verschieben
-					if shouldMove {
-						_ = moveFilesToSubfolder(dirPath, block.Files, "verarbeitet")
+				// Sicherheitsnetz: Ausgabedatei muss wirklich existieren
+				if info, statErr := os.Stat(filepath.Join(dirPath, outName)); statErr != nil || info.Size() == 0 {
+					failures = append(failures, fmt.Sprintf("Tag %s: FFmpeg hat keine Ausgabedatei erzeugt\nFFmpeg-Ausgabe: %s", block.DateStr, tail(string(output), 600)))
+					continue
+				}
+
+				outputs = append(outputs, outName)
+
+				// Wenn gewünscht, Quelldateien nach "verarbeitet" verschieben
+				if shouldMove {
+					if err := moveFilesToSubfolder(dirPath, block.Files, "verarbeitet"); err != nil {
+						movedAll = false
+						failures = append(failures, fmt.Sprintf("Tag %s: Quelldateien konnten nicht (vollständig) verschoben werden:\n%v", block.DateStr, err))
 					}
 				}
 			}
 
-			if len(errors) > 0 {
-				dialog.ShowError(fmt.Errorf("Fehler bei der Ausführung:\n%s", strings.Join(errors, "\n")), parentWin)
-			} else {
-				msg := fmt.Sprintf("Erfolgreich %d ausgewählte(n) Tagesblock/Blöcke zusammengefügt!", processedBlocks)
-				if shouldMove {
+			// UI-Änderungen müssen im Fyne-Hauptthread laufen
+			fyne.Do(func() {
+				progressDialog.Hide()
+
+				created := ""
+				if len(outputs) > 0 {
+					created = fmt.Sprintf("Erstellt (%d):\n%s", len(outputs), strings.Join(outputs, "\n"))
+				}
+
+				if len(failures) > 0 {
+					msg := "Fehler bei der Ausführung:\n" + strings.Join(failures, "\n")
+					if created != "" {
+						msg += "\n\n" + created
+					}
+					dialog.ShowError(errors.New(msg), parentWin)
+					return
+				}
+
+				msg := fmt.Sprintf("Erfolgreich %d ausgewählte(n) Tagesblock/Blöcke zusammengefügt!\n\n%s", len(outputs), created)
+				if shouldMove && movedAll {
 					msg += "\n\nDie Quelldateien wurden in den Ordner 'verarbeitet' verschoben."
 				}
 				dialog.ShowInformation("Erfolg", msg, parentWin)
-			}
+			})
 		}()
 	})
 	okBtn.Importance = widget.HighImportance
 
-	headerText := fmt.Sprintf("Erkannter Kamera-Typ: %s\nArbeitsordner: %s\n\nWähle die Tagesblöcke aus, die zusammengefügt werden sollen:", result.CamType, dirPath)
+	headerText := fmt.Sprintf("Erkannter Kamera-Typ: %s\nArbeitsordner: %s", result.CamType, dirPath)
+	if result.Ignored > 0 {
+		headerText += fmt.Sprintf("\nHinweis: %d Datei(en) anderer Kamera-Schemata werden ignoriert.", result.Ignored)
+	}
+	headerText += "\n\nWähle die Tagesblöcke aus, die zusammengefügt werden sollen:"
 	headerLabel := widget.NewLabel(headerText)
 	headerLabel.Wrapping = fyne.TextWrapWord
 
@@ -356,20 +435,30 @@ func showProgressDialog(message string, parentWin fyne.Window) dialog.Dialog {
 	return d
 }
 
-// Verschiebt eine Liste von Dateien in einen Unterordner
+// Verschiebt eine Liste von Dateien in einen Unterordner.
+// Vorhandene Dateien im Zielordner werden nicht überschrieben.
+// Alle aufgetretenen Fehler werden gesammelt zurückgegeben.
 func moveFilesToSubfolder(dirPath string, filenames []string, subfolder string) error {
 	targetDir := filepath.Join(dirPath, subfolder)
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return err
 	}
 
+	var errs []error
 	for _, fname := range filenames {
 		oldPath := filepath.Join(dirPath, fname)
 		newPath := filepath.Join(targetDir, fname)
-		_ = os.Rename(oldPath, newPath)
+
+		if _, err := os.Stat(newPath); err == nil {
+			errs = append(errs, fmt.Errorf("%s: existiert im Ordner '%s' bereits", fname, subfolder))
+			continue
+		}
+		if err := os.Rename(oldPath, newPath); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", fname, err))
+		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // Öffnet Popup zur Dateianzeige
