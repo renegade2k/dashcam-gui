@@ -1,5 +1,1 @@
-app.exe
-*.exe
-
-*.exe~
-
+/target

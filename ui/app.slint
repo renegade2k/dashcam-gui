@@ -1,0 +1,224 @@
+import { Button, CheckBox, LineEdit, ListView, ProgressIndicator } from "std-widgets.slint";
+
+export struct BlockItem {
+    label: string,
+    checked: bool,
+}
+
+// ---------------------------------------------------------------- Hauptfenster
+export component MainWindow inherits Window {
+    title: "Dashcam GUI";
+    preferred-width: 850px;
+    preferred-height: 480px;
+
+    in property <string> work-dir;
+    in property <bool> ffmpeg-ok;
+    in property <bool> busy;
+    in property <string> busy-text;
+
+    callback choose-folder();
+    callback open-folder();
+    callback show-files();
+    callback combine();
+    callback cut();
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+        alignment: start;
+
+        Text { text: "Schritt 1: Wähle den Ordner mit deinen Dashcam-Aufnahmen"; }
+        Button {
+            text: "Arbeitsordner wählen...";
+            clicked => { root.choose-folder(); }
+        }
+        Text {
+            text: root.work-dir == "" ? "Kein Arbeitsordner ausgewählt" : "Aktueller Pfad: " + root.work-dir;
+            font-weight: 700;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Button {
+                text: "Arbeitsordner öffnen";
+                enabled: root.work-dir != "";
+                clicked => { root.open-folder(); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "Videos anzeigen";
+                enabled: root.work-dir != "";
+                clicked => { root.show-files(); }
+            }
+        }
+        Rectangle { height: 1px; background: #88888866; }
+        Text { text: "Schritt 2: Operationen durchführen"; }
+        Button {
+            text: "Kombinieren";
+            enabled: root.work-dir != "" && root.ffmpeg-ok;
+            clicked => { root.combine(); }
+        }
+        Button {
+            text: "Video schneiden";
+            enabled: root.work-dir != "" && root.ffmpeg-ok;
+            clicked => { root.cut(); }
+        }
+        if !root.ffmpeg-ok: Text {
+            text: "⚠ FFmpeg wurde nicht gefunden. Bitte installieren und im PATH verfügbar machen, dann die App neu starten.";
+            color: #e5a50a;
+            wrap: word-wrap;
+        }
+    }
+
+    // Lade-Overlay (ersetzt den Fortschrittsdialog)
+    if root.busy: Rectangle {
+        background: #000000a0;
+        TouchArea { }
+        VerticalLayout {
+            alignment: center;
+            padding: 40px;
+            spacing: 10px;
+            Text {
+                text: root.busy-text;
+                font-weight: 700;
+                color: white;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: "Bitte warten, FFmpeg arbeitet im Hintergrund...";
+                color: white;
+                horizontal-alignment: center;
+            }
+            ProgressIndicator { indeterminate: true; }
+        }
+    }
+}
+
+// ------------------------------------------------------ Dateiliste (Videos)
+export component FileListWindow inherits Window {
+    in property <string> window-title;
+    in property <string> header;
+    in property <[string]> files;
+
+    title: root.window-title;
+    preferred-width: 500px;
+    preferred-height: 400px;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+        Text { text: root.header; font-italic: true; wrap: word-wrap; }
+        Rectangle { height: 1px; background: #88888866; }
+        ListView {
+            for f in root.files: Rectangle {
+                height: 26px;
+                Text { x: 6px; text: f; vertical-alignment: center; }
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------- Video schneiden
+export component CutWindow inherits Window {
+    title: "Video schneiden";
+    preferred-width: 600px;
+    preferred-height: 450px;
+
+    in property <[string]> videos;
+    in-out property <int> selected: -1;
+
+    callback export-cut(int, string, string);
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+
+        Text { text: "1. Video in der Liste markieren:"; font-weight: 700; }
+        ListView {
+            for v[i] in root.videos: Rectangle {
+                height: 28px;
+                background: root.selected == i ? #3584e480 : transparent;
+                Text { x: 6px; text: v; vertical-alignment: center; }
+                TouchArea { clicked => { root.selected = i; } }
+            }
+        }
+        Text { text: "2. Zeiten festlegen (Sekunden oder MM:SS):"; font-weight: 700; }
+        HorizontalLayout {
+            spacing: 8px;
+            start := LineEdit { placeholder-text: "Start (z.B. 50 oder 1:20)"; }
+            stop := LineEdit { placeholder-text: "Ende (z.B. 120 oder 2:45)"; }
+        }
+        Text {
+            text: "Hinweis: Der Schnitt erfolgt verlustfrei an Keyframes und ist daher nicht sekundengenau.";
+            wrap: word-wrap;
+        }
+        Rectangle { height: 1px; background: #88888866; }
+        Button {
+            text: "Ausschnitt exportieren";
+            primary: true;
+            clicked => { root.export-cut(root.selected, start.text, stop.text); }
+        }
+    }
+}
+
+// ------------------------------------------------------ Kombinieren (Bestätigung)
+export component CombineWindow inherits Window {
+    title: "Operation bestätigen: Kombinieren";
+    preferred-width: 600px;
+    preferred-height: 480px;
+
+    in property <string> header;
+    in property <[BlockItem]> blocks;
+    in-out property <bool> move-files: false;
+
+    callback toggle(int);
+    callback select-all();
+    callback cancel();
+    callback confirm();
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+
+        Text { text: root.header; wrap: word-wrap; }
+        Button {
+            text: "Alle / Keine auswählen";
+            clicked => { root.select-all(); }
+        }
+        Rectangle { height: 1px; background: #88888866; }
+        ListView {
+            for b[i] in root.blocks: Rectangle {
+                height: 30px;
+                Rectangle {
+                    x: 4px;
+                    y: (parent.height - self.height) / 2;
+                    width: 18px;
+                    height: 18px;
+                    border-width: 1px;
+                    border-color: #888888;
+                    border-radius: 3px;
+                    background: b.checked ? #3584e4 : transparent;
+                    Text {
+                        text: b.checked ? "✓" : "";
+                        color: white;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                Text { x: 32px; text: b.label; vertical-alignment: center; }
+                TouchArea { clicked => { root.toggle(i); } }
+            }
+        }
+        Rectangle { height: 1px; background: #88888866; }
+        CheckBox {
+            text: "Quelldateien nach dem Kombinieren in Ordner 'verarbeitet' verschieben";
+            checked <=> root.move-files;
+        }
+        HorizontalLayout {
+            alignment: center;
+            spacing: 8px;
+            Button { text: "Abbrechen"; clicked => { root.cancel(); } }
+            Button { text: "OK (Ausführen)"; primary: true; clicked => { root.confirm(); } }
+        }
+    }
+}

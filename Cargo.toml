@@ -1,0 +1,16 @@
+[package]
+name = "dashcam-gui"
+version = "0.0.4"
+edition = "2021"
+
+[dependencies]
+slint = "1.16"
+regex = "1"
+rfd = "0.15"
+
+[build-dependencies]
+slint-build = "1.16"
+
+[profile.release]
+lto = true
+strip = true
