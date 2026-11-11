@@ -1,0 +1,78 @@
+name: Release
+
+# Läuft, sobald ein Tag wie v0.0.4 gepusht wird
+on:
+  push:
+    tags: ["v*"]
+
+# Nötig, damit der Workflow das Release anlegen darf
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            bin: dashcam-gui.exe
+            asset: dashcam-gui-windows-x86_64.exe
+          - name: Linux
+            os: ubuntu-latest
+            bin: dashcam-gui
+            asset: dashcam-gui-linux-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux-Abhängigkeiten installieren
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev
+
+      - name: Rust aktualisieren
+        run: rustup update stable && rustup default stable
+
+      - name: Tests ausführen
+        run: cargo test --release
+
+      - name: Release-Build erstellen
+        run: cargo build --release
+
+      - name: Binary umbenennen
+        shell: bash
+        run: cp "target/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+
+      - name: Binary zwischenspeichern
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    name: GitHub-Release erstellen
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Binaries herunterladen
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release anlegen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "Dashcam GUI ${{ github.ref_name }}" \
+            --generate-notes
